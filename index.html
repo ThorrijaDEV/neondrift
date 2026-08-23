@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>✦ NEONDRIFT ✦</title>
+<style>
+:root{--pink:#ff2ec4;--cyan:#00f0ff;--lime:#c6ff00;--bg:#0b0514}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:var(--bg);overflow:hidden;font-family:ui-monospace,Menlo,Consolas,monospace;
+  -webkit-user-select:none;user-select:none;touch-action:manipulation}
+#wrap{position:relative;height:100vh;display:flex;align-items:center;justify-content:center}
+canvas{display:block;image-rendering:pixelated;border-radius:10px;box-shadow:0 0 60px rgba(255,46,196,.25)}
+#hud{position:absolute;top:14px;left:50%;transform:translateX(-50%);text-align:center;color:#efeaff;
+  font-size:13px;letter-spacing:2px;text-shadow:0 0 8px rgba(0,240,255,.6);pointer-events:none;z-index:2}
+#hud b{color:var(--lime);font-size:20px;display:block}
+#overlay{position:absolute;inset:0;display:flex;flex-direction:column;gap:14px;align-items:center;justify-content:center;
+  background:rgba(11,5,20,.82);z-index:3;text-align:center;padding:20px}
+#overlay h1{color:var(--pink);font-size:min(9vw,44px);letter-spacing:8px;font-weight:900;text-shadow:0 0 24px rgba(255,46,196,.7)}
+#overlay p{color:#9a90c8;font-size:13px;line-height:1.9;letter-spacing:1px;max-width:520px}
+#overlay .k{color:var(--cyan)} #overlay .hi{color:var(--lime)}
+button{cursor:pointer;border:0;border-radius:999px;padding:12px 34px;font-family:inherit;font-size:15px;font-weight:900;
+  letter-spacing:3px;background:linear-gradient(90deg,var(--pink),#7b2eff);color:#fff;
+  box-shadow:0 4px 24px rgba(255,46,196,.45)}
+button:active{transform:scale(.96)}
+footer{position:absolute;bottom:10px;width:100%;text-align:center;color:#584f80;font-size:10px;letter-spacing:1px;z-index:1}
+</style>
+</head>
+<body>
+<div id="wrap">
+<canvas id="cv" width="960" height="420"></canvas>
+<div id="hud"><b id="score">0</b>PUNTOS</div>
+<div id="overlay" style="display:flex">
+  <h1>NEONDRIFT</h1>
+  <p>corre · salta · sobrevive al drift<br>
+  <span class="k">[ESPACIO]</span> saltar (×2 en el aire) &nbsp; <span class="k">[P]</span> pausa &nbsp; <span class="k">[R]</span> reinicio<br>
+  récord local: <span class="hi" id="hival">0</span></p>
+  <button id="go">▶ JUGAR</button>
+</div>
+<footer>neondrift v0.1 · single file · chiptune generado con WebAudio · sin assets</footer>
+</div>
+
+<script>
+"use strict";
+/* ====== lógica pura (testeable) ====== */
+const GRAV = 2600, JUMP_V = -880, GROUND_Y = 340;
+
+function aabb(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+function next_spawn_x(lastX, speed) {
+  const gap = 220 + Math.random() * 260 - Math.min(120, speed * 0.35);
+  return lastX + Math.max(160, gap);
+}
+
+function make_obstacle(x) {
+  const kind = Math.random() < 0.72 ? "block" : "spike";
+  if (kind === "block") {
+    const tall = Math.random() < 0.4;
+    return { x, w: 34 + Math.random() * 26, h: tall ? 92 : 48, y: GROUND_Y - (tall ? 92 : 48),
+             kind: "block", passed: false };
+  }
+  return { x, w: 30, h: 40, y: GROUND_Y - 40, kind: "spike", passed: false };
+}
+
+function physics(p, dt, jumping) {
+  p.vy += GRAV * dt;
+  if (jumping && p.jumps > 0) { p.vy = JUMP_V; p.jumps--; }
+  p.y += p.vy * dt;
+  if (p.y >= GROUND_Y - p.h) { p.y = GROUND_Y - p.h; p.vy = 0; p.jumps = 2; }
+  return p;
+}
+
+function score_of(dist, mult) { return Math.floor(dist / 10) * mult; }
+
+const selftest = () => {
+  const out = [];
+  const eq = (n, g, w) => out.push(`${n}:${g === w ? "PASS" : "FAIL"}:${g}`);
+  const P = () => ({ x: 100, y: GROUND_Y - 40, w: 36, h: 40, vy: 0, jumps: 2 });
+  // gravedad integra en el aire (sin tocar suelo)
+  let air = { ...P(), y: GROUND_Y - 140 };
+  let p = physics(air, 1 / 60, false);
+  eq("grav", p.vy > 0 && p.y > GROUND_Y - 140 ? "si" : "no", "si");
+  // salto consume un jump y sube
+  p = physics({ ...P() }, 1 / 60, true);
+  eq("jump", p.vy === JUMP_V && p.jumps === 1 ? "si" : "no", "si");
+  // sin saltos disponibles en el aire: no impulsa
+  let q = { ...P(), y: GROUND_Y - 140, jumps: 0 };
+  q = physics(q, 1 / 60, true);
+  eq("nojumps", q.jumps === 0 && q.vy > 0 ? "si" : "no", "si");
+  // aterrizaje repone los dos saltos
+  let r = { ...P(), y: GROUND_Y - 1, vy: 100, jumps: 0 };
+  r = physics(r, 1 / 60, false);
+  eq("land", r.jumps === 2 && r.vy === 0 ? "si" : "no", "si");
+  // colisión frontal
+  eq("aabb-hit", aabb({x:0,y:0,w:10,h:10}, {x:5,y:5,w:10,h:10}) ? "hit":"miss", "hit");
+  eq("aabb-miss", aabb({x:0,y:0,w:10,h:10}, {x:11,y:5,w:10,h:10}) ? "hit":"miss", "miss");
+  // spawn respeta separación mínima
+  let ok = true;
+  for (let i = 0; i < 200; i++) {
+    const nx = next_spawn_x(500, 300);
+    ok = ok && nx >= 500 + 160;
+    if (!ok) break;
+  }
+  eq("spawn-gap", ok ? "si" : "no", "si");
+  // obstáculos apoyados en el suelo
+  for (let i = 0; i < 100; i++) {
+    const o = make_obstacle(i);
+    if (Math.abs(o.y + o.h - GROUND_Y) > 1e-9) { eq("obst-ground", i, "ERR"); return out.join(" "); }
+  }
+  eq("obst-ground", "si", "si");
+  eq("score", score_of(1234, 1), 123);
+  return out.map(s => s.split(":").slice(0, 2).join(":")).join(" ");
+};
+
+/* ====== audio procedural ====== */
+let AC = null;
+function ac() { if (!AC) AC = new (window.AudioContext || window.webkitAudioContext)(); return AC; }
+function blip(freq, dur = 0.09, type = "square", vol = 0.12) {
+  try {
+    const c = ac(), o = c.createOscillator(), g = c.createGain();
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, c.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, c.currentTime + dur);
+    o.connect(g).connect(c.destination);
+    o.start(); o.stop(c.currentTime + dur);
+  } catch (e) {}
+}
+function arpLoop() {
+  const notes = [220, 277.18, 329.63, 440, 329.63, 277.18];
+  let i = 0;
+  return setInterval(() => { if (running && !paused) blip(notes[i++ % notes.length], 0.07, "sawtooth", 0.03); }, 150);
+}
+
+/* ====== render + loop ====== */
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+const W = cv.width, H = cv.height;
+const COL = { bg1:"#0b0514", bg2:"#1d1038", ground:"#7b2eff", grid:"#2a1854",
+              player:"#ff2ec4", block:"#00f0ff", spike:"#ffe600", part:"#c6ff00" };
+
+let running = false, paused = false;
+let px = 100, py, pvy, pjumps, dist, obstacles, particles, speed, lastSpawn, tPrev, rafId, musicId;
+let hi = Number(localStorage.getItem("neondrift-hi") || 0);
+document.getElementById("hival").textContent = hi;
+
+function reset() {
+  py = GROUND_Y - 40; pvy = 0; pjumps = 2;
+  dist = 0; speed = 380; obstacles = []; particles = [];
+  lastSpawn = W + 100;
+}
+
+function spawnAhead() {
+  while (lastSpawn < W + 400) {
+    const o = make_obstacle(lastSpawn);
+    obstacles.push(o);
+    lastSpawn = next_spawn_x(lastSpawn, speed);
+  }
+}
+
+function burst(x, y) {
+  for (let i = 0; i < 22; i++)
+    particles.push({ x, y, vx: (Math.random()-.5)*520, vy: -Math.random()*480,
+                     life: .5 + Math.random()*.4 });
+}
+
+function step(dt) {
+  speed += dt * 9;
+  dist += speed * dt;
+  const pl = { x: px, y: py, w: 36, h: 40 };
+  spawnAhead();
+  for (const o of obstacles) {
+    o.x -= speed * dt;
+    if (!o.passed && o.x + o.w < px) { o.passed = true; blip(880, .05, "square", .05); }
+    if (aabb(pl, o)) { die(); return; }
+  }
+  obstacles = obstacles.filter(o => o.x + o.w > -40);
+  lastSpawn -= speed * dt;
+}
+
+function draw(t) {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, COL.bg1); g.addColorStop(1, COL.bg2);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+  // rejilla perspectiva
+  ctx.strokeStyle = COL.grid; ctx.lineWidth = 1;
+  const off = (t * speed * 0.06) % 64;
+  for (let x = -off; x < W; x += 64) { ctx.beginPath(); ctx.moveTo(x, H); ctx.lineTo(W/2 + (x-W/2)*.28, GROUND_Y-140); ctx.stroke(); }
+
+  // suelo neón
+  ctx.fillStyle = COL.ground; ctx.fillRect(0, GROUND_Y, W, 4);
+  ctx.fillStyle = "#150a26"; ctx.fillRect(0, GROUND_Y+4, W, H-GROUND_Y-4);
+  ctx.strokeStyle = "#3a2564";
+  for (let x = -(off*2)%48; x < W; x += 48) { ctx.beginPath(); ctx.moveTo(x, GROUND_Y+4); ctx.lineTo(x-30, H); ctx.stroke(); }
+
+  // obstáculos
+  for (const o of obstacles) {
+    ctx.fillStyle = o.kind === "spike" ? COL.spike : COL.block;
+    if (o.kind === "spike") {
+      ctx.beginPath();
+      ctx.moveTo(o.x, o.y+o.h); ctx.lineTo(o.x+o.w/2, o.y); ctx.lineTo(o.x+o.w, o.y+o.h);
+      ctx.closePath(); ctx.fill();
+    } else {
+      ctx.fillRect(o.x, o.y, o.w, o.h);
+      ctx.strokeStyle = "#fff"; ctx.globalAlpha = .18; ctx.strokeRect(o.x+.5, o.y+.5, o.w-1, o.h-1); ctx.globalAlpha = 1;
+    }
+  }
+
+  // jugador cuadrado neón con estela
+  ctx.shadowColor = COL.player; ctx.shadowBlur = 18;
+  ctx.fillStyle = COL.player; ctx.fillRect(px, py, 36, 40);
+  ctx.shadowBlur = 0;
+  ctx.fillStyle = "#fff"; ctx.globalAlpha=.75; ctx.fillRect(px+8, py+9, 8, 6); ctx.globalAlpha=1;
+
+  // partículas
+  ctx.fillStyle = COL.part;
+  for (const p of particles) {
+    p.life -= 1/60; p.x += p.vx/60; p.vy += 900/60; p.y += p.vy/60;
+    if (p.life > 0) { ctx.globalAlpha = Math.min(1, p.life); ctx.fillRect(p.x, p.y, 5, 5); }
+  }
+  ctx.globalAlpha = 1;
+  particles = particles.filter(p => p.life > 0);
+}
+
+function die() {
+  running = false; burst(px + 18, py + 20);
+  blip(110, .4, "sawtooth", .2); setTimeout(() => blip(55, .5, "square", .18), 90);
+  const s = score_of(dist, 1);
+  if (s > hi) { hi = s; localStorage.setItem("neondrift-hi", hi); document.getElementById("hival").textContent = hi; }
+  document.querySelector("#overlay h1").textContent = "DRIFT TOTAL";
+  document.querySelector("#overlay p").innerHTML =
+    `puntos: <span class="hi">${s}</span> · récord: <span class="hi">${hi}</span><br><span class="k">[R]</span> o el botón para volver`;
+  document.getElementById("go").textContent = "↻ OTRA VEZ";
+  setTimeout(() => document.getElementById("overlay").style.display = "flex", 550);
+}
+
+function frame(ts) {
+  rafId = requestAnimationFrame(frame);
+  const dt = Math.min(1/30, (ts - tPrev)/1000 || 0); tPrev = ts;
+  if (running) { if (!paused) step(dt); physics({ get x(){return px}, set x(v){}, y:py, vy:pvy, jumps:pjumps,
+      set y(v){py=v}, set vy(v){pvy=v}, set jumps(v){pjumps=v}, h:40 }, dt, false);
+    document.getElementById("score").textContent = score_of(dist, 1);
+  }
+  draw(ts);
+}
+
+function start() {
+  reset();
+  document.getElementById("overlay").style.display = "none";
+  running = true; paused = false;
+  try { ac().resume(); } catch(e){}
+  if (!musicId) musicId = arpLoop();
+  blip(440, .12); blip(660, .12);
+}
+
+document.getElementById("go").addEventListener("click", start);
+addEventListener("keydown", e => {
+  if (e.code === "Space") {
+    e.preventDefault();
+    if (!running) { start(); return; }
+    if (pjumps > 0) { pvy = JUMP_V; pjumps--; blip(520 + 120*(2-pjumps), .08); }
+  }
+  if (e.key === "p" && running) paused = !paused;
+  if (e.key === "r") start();
+});
+cv.addEventListener("pointerdown", () => {
+  if (!running) { start(); return; }
+  if (pjumps > 0) { pvy = JUMP_V; pjumps--; blip(520 + 120*(2-pjumps), .08); }
+});
+
+reset(); requestAnimationFrame(frame);
+window.__selftest = selftest;
+</script>
+</body>
+</html>
